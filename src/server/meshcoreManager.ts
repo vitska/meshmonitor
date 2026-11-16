@@ -5086,6 +5086,11 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       const port = new SerialPortClass({
         path,
         baudRate: this.config!.baudRate || 115200,
+        // Leave the modem control lines alone: asserting DTR/RTS resets an
+        // ESP32-based repeater (or drops it into the ROM loader), which looks
+        // like a dead or wedged console on the next `get name` (#5563).
+        dtr: false,
+        rts: false,
       });
       this.serialPort = port;
       let opened = false;
