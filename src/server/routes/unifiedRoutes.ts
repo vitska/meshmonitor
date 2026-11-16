@@ -9,6 +9,7 @@ import { Router, Request, Response } from 'express';
 import databaseService from '../../services/database.js';
 import packetLogService from '../services/packetLogService.js';
 import meshcorePacketLogService from '../services/meshcorePacketLogService.js';
+import mqttPacketLogService from '../services/mqttPacketLogService.js';
 import { optionalAuth } from '../auth/authMiddleware.js';
 import { logger } from '../../utils/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
@@ -45,6 +46,9 @@ import { canonicalMessageTime, plausibleRxTime } from '../utils/messageTime.js';
 import { storedWireSecond } from '../../utils/meshcoreReactionTarget.js';
 import type { DbPacketLog } from '../../db/types.js';
 import type { DbMeshCorePacket } from '../../db/repositories/meshcore.js';
+import type { MqttGroupedPacket } from '../../db/repositories/mqttPacketLog.js';
+import { decodeMeshCorePacket, type DecodedMeshCorePacket } from '../../utils/meshcorePacketDecode.js';
+import { decodeGroupPacketForViewer } from '../utils/meshcorePacketPlaintext.js';
 import { resolveMeshcoreKeyAccess, filterKeyedMessages } from '../utils/meshcoreKeyAccess.js';
 import { keyedChannelNames } from '../utils/meshcoreKeyedChannels.js';
 import type { MeshCoreKeyAccessFilter } from '../../db/repositories/index.js';
@@ -68,34 +72,215 @@ import {
 import { loadMqttConsentHiddenSet, dropMessagesNamingHiddenNodes, dropPacketsNamingHiddenNodes, dropRowsNamingHiddenNodes } from '../utils/mqttConsentVisibility.js';
 
 const router = Router();
+const MESHCORE_PREVIEW_MAX = 200;
+const MESHCORE_PREVIEW_CACHE_MS = 60_000;
+const MESHCORE_PREVIEW_CACHE_MAX = 1000;
+
+interface MeshCorePreviewValue {
+  preview: string | null;
+  sender: string | null;
+}
+
+const meshcorePreviewCache = new Map<string, { value: MeshCorePreviewValue; expires: number }>();
+
+/** Trim a decoded group message down to a preview-length string. */
+function previewText(value: unknown): string {
+  const text = String(value ?? '').replace(/\u0000/g, '').trim();
+  return text.length > MESHCORE_PREVIEW_MAX ? `${text.slice(0, MESHCORE_PREVIEW_MAX - 1)}…` : text;
+}
+
+/** Decode a MeshCore packet-log row; null when there is nothing to decode. */
+function decodeMeshCoreRow(p: DbMeshCorePacket): DecodedMeshCorePacket | null {
+  if (!p.rawHex) return null;
+  try {
+    return decodeMeshCorePacket(p.rawHex);
+  } catch {
+    return null;
+  }
+}
+
+/** One-line summary of what a MeshCore packet carries, for the unified list. */
+function meshcorePacketPreview(p: DbMeshCorePacket, decoded: DecodedMeshCorePacket | null): string {
+  const type = Number(p.payloadType);
+  const typeName =
+    p.payloadTypeName ?? decoded?.header.payloadTypeName ?? `0x${type.toString(16).padStart(2, '0')}`;
+  const route = p.routeTypeName ?? decoded?.header.routeTypeName ?? '';
+  const hops = typeof p.hopCount === 'number' ? p.hopCount : decoded?.path.hopCount;
+  const suffix = [route, typeof hops === 'number' && hops > 0 ? `${hops} hop${hops === 1 ? '' : 's'}` : '']
+    .filter(Boolean)
+    .join(' · ');
+  const payload = decoded?.payload;
+  const message = payload?.message;
+  const src = p.srcHash ?? message?.srcHash ?? '';
+  const advert = payload?.advert;
+  const group = payload?.groupText ?? payload?.groupData;
+
+  if (type === 0x04) {
+    const who = p.advertName ?? advert?.name ?? (p.senderPubKey ?? advert?.publicKey ?? '').slice(0, 8);
+    return previewText(`[ADVERT${who ? `: ${who}` : ''}${suffix ? ` · ${suffix}` : ''}]`);
+  }
+  if (type === 0x05 || type === 0x06) {
+    const channel = group?.channelHash ? ` · ch ${group.channelHash}` : '';
+    return previewText(`[${typeName}${channel}${suffix ? ` · ${suffix}` : ''} · encrypted]`);
+  }
+  if (type === 0x07 && (p.senderPubKey ?? advert?.publicKey)) {
+    const key = p.senderPubKey ?? advert?.publicKey ?? '';
+    return previewText(`[${typeName} · sender ${key.slice(0, 8)}${suffix ? ` · ${suffix}` : ''}]`);
+  }
+  if (type === 0x0b) {
+    const control = payload?.control;
+    return previewText(`[CONTROL${control?.subTypeName ? `: ${control.subTypeName}` : ''}${suffix ? ` · ${suffix}` : ''}]`);
+  }
+  if (type === 0x0a) {
+    const multipart = payload?.multipart;
+    return previewText(
+      `[MULTIPART${multipart?.innerTypeName ? `: ${multipart.innerTypeName}` : ''}${suffix ? ` · ${suffix}` : ''}]`,
+    );
+  }
+  if (type === 0x08 || type === 0x09) {
+    return previewText(`[${typeName}${suffix ? ` · ${suffix}` : ''}]`);
+  }
+  return previewText(`[${typeName}${src ? ` · src ${src}` : ''}${suffix ? ` · ${suffix}` : ''}]`);
+}
+
+/**
+ * Sender / recipient identity for a MeshCore packet row.
+ *
+ * MeshCore frames carry no node numbers, so the unified packet list gets the
+ * best identity the wire actually offers: an advert name or key prefix, the
+ * plaintext src/dest hashes of message frames, or a broadcast placeholder for
+ * group traffic.
+ */
+function meshcorePacketIdentity(
+  p: DbMeshCorePacket,
+  decoded: DecodedMeshCorePacket | null,
+): { fromName: string; fromId: string; toName: string; toId: string; toNode: number | null } {
+  const type = Number(p.payloadType);
+  const payload = decoded?.payload;
+  const advert = payload?.advert;
+  const message = payload?.message;
+  const control = payload?.control;
+
+  const senderKey = p.senderPubKey ?? advert?.publicKey ?? control?.discoverResponse?.publicKey ?? '';
+  const srcHash = p.srcHash ?? message?.srcHash ?? (senderKey ? senderKey.slice(0, 2) : '');
+  const advertName = p.advertName ?? advert?.name ?? '';
+  const destHash = message?.destHash ?? '';
+
+  let fromName = 'Unknown';
+  let fromId = 'mc:unknown';
+  let toName = 'Unknown';
+  let toId = 'mc:unknown';
+  let toNode: number | null = null;
+
+  if (type === 0x04) {
+    fromName = advertName || (senderKey ? `ADVERT ${senderKey.slice(0, 8)}` : 'ADVERT');
+    fromId = senderKey ? `mc:${senderKey}` : srcHash ? `mc:src:${srcHash}` : 'mc:advert';
+    toName = 'Broadcast';
+    toId = '!ffffffff';
+    toNode = 4294967295;
+  } else if (type === 0x05 || type === 0x06) {
+    // Group frames carry no sender identity on the wire. The channel name is
+    // only available after a keyed decrypt, which the preview handles.
+    toName = 'Broadcast';
+    toId = '!ffffffff';
+    toNode = 4294967295;
+  } else if (senderKey && type === 0x07) {
+    fromName = `sender:${senderKey.slice(0, 8)}`;
+    fromId = `mc:${senderKey}`;
+    toName = destHash ? `dest:${destHash}` : 'Unknown';
+    toId = destHash ? `mc:dest:${destHash}` : 'mc:unknown';
+  } else if (message) {
+    fromName = srcHash ? `src:${srcHash}` : 'Unknown';
+    fromId = srcHash ? `mc:src:${srcHash}` : 'mc:unknown';
+    toName = destHash ? `dest:${destHash}` : 'Unknown';
+    toId = destHash ? `mc:dest:${destHash}` : 'mc:unknown';
+  } else if (control?.discoverResponse?.publicKey) {
+    const key = control.discoverResponse.publicKey;
+    fromName = `node:${key.slice(0, 8)}`;
+    fromId = `mc:${key}`;
+  }
+
+  return { fromName, fromId, toName, toId, toNode };
+}
+
+/**
+ * Decrypt a group frame for this viewer, with a short per-viewer cache.
+ *
+ * Only the first rows of a page are decrypted (the route caps the batch), and
+ * a decrypt that the viewer is not entitled to returns `decrypted: false`
+ * without revealing why; the caller keeps the encrypted summary in that case.
+ */
+async function meshcorePreviewForViewer(
+  p: DbMeshCorePacket,
+  fallback: string | null,
+  viewer: { id: number } | undefined,
+  sourceId: string,
+): Promise<MeshCorePreviewValue> {
+  const type = Number(p.payloadType);
+  if ((type !== 0x05 && type !== 0x06) || !p.rawHex) return { preview: fallback, sender: null };
+
+  const cacheKey = `${viewer?.id ?? 'anon'}|${sourceId}|${p.rawHex}`;
+  const now = Date.now();
+  const cached = meshcorePreviewCache.get(cacheKey);
+  if (cached && cached.expires > now) return cached.value;
+
+  let preview = fallback;
+  let sender: string | null = null;
+  try {
+    const plain = await decodeGroupPacketForViewer(viewer, sourceId, p.rawHex);
+    if (plain?.decrypted) {
+      if (plain.text?.text) {
+        const channel = plain.channelName || 'group';
+        sender = plain.text.sender || null;
+        const who = sender ? `${sender}: ` : '';
+        preview = previewText(`[${channel}] ${who}${plain.text.text}`);
+      } else if (plain.data) {
+        const channel = plain.channelName || 'group';
+        preview = previewText(`[${channel} · GRP_DATA ${plain.data.dataType}] ${plain.data.dataHex}`);
+      }
+    }
+  } catch {
+    // A decrypt failure must never fail the packet list; keep the summary.
+  }
+
+  const value = { preview, sender };
+  meshcorePreviewCache.set(cacheKey, { value, expires: now + MESHCORE_PREVIEW_CACHE_MS });
+  if (meshcorePreviewCache.size > MESHCORE_PREVIEW_CACHE_MAX) {
+    const oldest = meshcorePreviewCache.keys().next().value;
+    if (oldest !== undefined) meshcorePreviewCache.delete(oldest);
+  }
+  return value;
+}
+
 
 /**
  * Project a MeshCore OTA packet-log row onto the Meshtastic `DbPacketLog` shape
  * so it can ride in the unified packet stream alongside Meshtastic rows.
  *
- * MeshCore OTA captures are far sparser than Meshtastic: there is no sender,
- * recipient, channel, direction-other-than-RX, or decoded payload. Those fields
- * are left null so the frontend renders them as N/A. `payloadType`/Name map onto
- * `portnum`/`portnum_name`, and SNR/RSSI/size carry across directly.
+ * MeshCore OTA captures have no node numbers, recipient numbers, channel slot
+ * or decoded payload. We fill the packet-monitor columns with what the wire
+ * does carry: ADVERT name/public key, the plaintext src/dest hashes of message
+ * frames, the relay path, and a payload-type summary. Group frames stay
+ * encrypted until the keyed preview decrypts them for a permitted viewer.
  */
 function mapMeshCorePacketToTagged(
   p: DbMeshCorePacket,
   sourceId: string,
   sourceName: string
 ): DbPacketLog & { sourceId: string; sourceName: string } {
+  const decoded = decodeMeshCoreRow(p);
+  const identity = meshcorePacketIdentity(p, decoded);
+
   return {
     id: p.id,
     packet_id: null,
     timestamp: p.timestamp,
-    // No numeric sender id (frontend Meshtastic links stay off). Show the
-    // derived sender (#6262): advert name, else a key prefix, else the src hash.
     from_node: 0,
-    from_node_id: null,
-    from_node_longName:
-      p.advertName ?? (p.senderPubKey ? p.senderPubKey.slice(0, 8) : p.srcHash ? `#${p.srcHash}` : null),
-    to_node: null,
-    to_node_id: null,
-    to_node_longName: null,
+    from_node_id: identity.fromId,
+    from_node_longName: identity.fromName,
+    to_node: identity.toNode,
+    to_node_id: identity.toId,
+    to_node_longName: identity.toName,
     channel: null,
     portnum: p.payloadType,
     portnum_name: p.payloadTypeName ?? null,
@@ -108,13 +293,81 @@ function mapMeshCorePacketToTagged(
     payload_size: p.payloadSize ?? null,
     want_ack: null,
     priority: null,
-    payload_preview: null,
-    metadata: null,
+    payload_preview: meshcorePacketPreview(p, decoded),
+    metadata: JSON.stringify({
+      meshcore: true,
+      payloadType: p.payloadType,
+      payloadTypeName: p.payloadTypeName ?? null,
+      routeType: p.routeType ?? null,
+      routeTypeName: p.routeTypeName ?? null,
+      pathLenRaw: p.pathLenRaw ?? null,
+      hopCount: p.hopCount ?? null,
+      pathHops: p.pathHops ?? null,
+      srcHash: p.srcHash ?? null,
+      senderPubKey: p.senderPubKey ?? null,
+      advertName: p.advertName ?? null,
+      observerId: p.observerId ?? null,
+    }),
     direction: 'rx',
     created_at: p.createdAt,
     decrypted_by: null,
     decrypted_channel_id: null,
     transport_mechanism: null,
+    sourceId,
+    sourceName,
+  };
+}
+
+/**
+ * Project an MQTT packet-monitor grouped row onto the Meshtastic `DbPacketLog`
+ * shape. `mqtt_packet_log` stores one row per gateway reception; the grouped
+ * row collapses them, so gateway/reception counts go into `metadata` and the
+ * row is tagged with the MQTT source that received it.
+ */
+function mapMqttPacketToTagged(
+  p: MqttGroupedPacket,
+  sourceId: string,
+  sourceName: string
+): DbPacketLog & { sourceId: string; sourceName: string } {
+  return {
+    id: Number(p.packetId ?? 0),
+    packet_id: p.packetId != null ? Number(p.packetId) : null,
+    timestamp: Number(p.lastHeard),
+    from_node: p.fromNode != null ? Number(p.fromNode) : 0,
+    from_node_id: p.fromNodeId ?? null,
+    from_node_longName: null,
+    to_node: p.toNode != null ? Number(p.toNode) : null,
+    to_node_id: p.toNodeId ?? null,
+    to_node_longName: null,
+    channel: p.channel != null ? Number(p.channel) : null,
+    portnum: p.portnum != null ? Number(p.portnum) : 0,
+    portnum_name: p.portnumName ?? null,
+    encrypted: p.encrypted === 1,
+    snr: null,
+    rssi: null,
+    hop_limit: null,
+    hop_start: null,
+    relay_node: null,
+    payload_size: p.payloadSize != null ? Number(p.payloadSize) : null,
+    want_ack: null,
+    priority: null,
+    payload_preview: p.payloadPreview ?? null,
+    metadata: JSON.stringify({
+      mqtt: true,
+      packetId: p.packetId,
+      channelId: p.channelId,
+      gatewayCount: Number(p.gatewayCount),
+      receptionCount: Number(p.receptionCount),
+      ingestOutcome: p.ingestOutcome,
+      bitfield: p.bitfield,
+      okToMqttViolation: p.okToMqttViolation,
+      firstHeard: Number(p.firstHeard),
+    }),
+    direction: 'rx',
+    created_at: Number(p.lastHeard),
+    decrypted_by: null,
+    decrypted_channel_id: null,
+    transport_mechanism: 5,
     sourceId,
     sourceName,
   };
@@ -1184,16 +1437,59 @@ router.get('/packets', async (req: Request, res: Response) => {
             payloadType: payload_type,
             routeType: route_type,
           });
-          // No channel/message content to redact — viewing is already authorized
-          // by the source-level packetmonitor:read check above.
+          // Viewing is already authorized by the source-level packetmonitor:read
+          // check above. Group frames are decrypted for this viewer, but only for
+          // the first rows of the page (each decrypt is a keyed trial) and the
+          // result is cached per viewer.
+          let decryptBudget = 50;
           const tagged = await Promise.all(raw.map(async (p) => {
             const row = mapMeshCorePacketToTagged(p, source.id, source.name);
+            const isGroup = Number(p.payloadType) === 0x05 || Number(p.payloadType) === 0x06;
+            if (isGroup && decryptBudget > 0) {
+              decryptBudget -= 1;
+              const revealed = await meshcorePreviewForViewer(p, row.payload_preview ?? null, user, source.id);
+              row.payload_preview = revealed.preview;
+              if (revealed.sender) {
+                row.from_node_longName = revealed.sender;
+                row.from_node_id = `mc:group:${revealed.sender}`;
+              }
+            }
             const input = await prepareMeshCoreReception(crossIndex, {
               sourceId: source.id, rawHex: p.rawHex, observerId: p.observerId,
             });
             return withCrossSourceFields(row, classifyMeshCoreReception(crossIndex, input), sourceNameById);
           }));
           return { rows: tagged, saturated: raw.length >= fetchLimit, oldest: oldestOf(raw) };
+        }
+
+        // MQTT sources have their own packet log (one row per gateway reception,
+        // grouped at read time) and never write to `packet_log`.
+        if (source.type.startsWith('mqtt')) {
+          if (transport_mechanism !== undefined && transport_mechanism !== 5) {
+            return { rows: [], saturated: false, oldest: null };
+          }
+          const mqttRaw = await mqttPacketLogService.getGroupedPackets({
+            sourceId: source.id,
+            limit: fetchLimit,
+            portnum,
+            encrypted,
+          });
+          const filtered = mqttRaw
+            .filter((p) => from_node === undefined || Number(p.fromNode) === from_node)
+            .filter((p) => untilTs === undefined || Number(p.lastHeard) < untilTs);
+          const mapped = filtered.map((p) => mapMqttPacketToTagged(p, source.id, source.name));
+          const { allowedChannels, canReadMessages } = await packetVisibilityForSource(
+            user,
+            isAdmin,
+            source.id
+          );
+          const visible = filterPacketsByPermissions(mapped, allowedChannels, isAdmin, canReadMessages);
+          const last = filtered[filtered.length - 1];
+          return {
+            rows: visible as unknown as TaggedPacket[],
+            saturated: mqttRaw.length >= fetchLimit,
+            oldest: last ? { ts: Number(last.lastHeard), id: Number(last.packetId ?? 0) } : null,
+          };
         }
 
         if (!meshtasticEligible) return { rows: [], saturated: false, oldest: null };
