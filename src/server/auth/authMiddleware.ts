@@ -256,6 +256,18 @@ export function optionalAuth() {
         }
       }
 
+      // No session user: accept a Bearer API token before falling through to
+      // anonymous, mirroring requireAuth (#4259). The token user goes through
+      // the same permission checks as a session user, so optional-auth
+      // endpoints (e.g. /api/unified/*) work for API-token clients instead of
+      // silently answering as the anonymous user.
+      if (!req.user) {
+        const tokenUser = await resolveBearerUser(req);
+        if (tokenUser) {
+          req.user = tokenUser;
+        }
+      }
+
       // If no authenticated user, attach anonymous user for permission checks
       if (!req.user) {
         const anonymousUser = await databaseService.findUserByUsernameAsync('anonymous');
