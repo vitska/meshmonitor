@@ -68,10 +68,16 @@ export async function loadSourcePresetNames(sourceIds: string[]): Promise<Map<st
   return out;
 }
 
-/** Every enabled Channel Database (virtual channel) entry; [] on error. */
+/**
+ * Every enabled Channel Database (virtual channel) entry; [] on error.
+ *
+ * `'all'` is deliberate: the unified views are cross-protocol, so the name
+ * lookup must see MeshCore rows too. The repository defaults to `'meshtastic'`
+ * and would otherwise leave MeshCore channels without a virtual name.
+ */
 export async function loadEnabledVirtualChannels(): Promise<DbChannelDatabase[]> {
   try {
-    const all = await databaseService.channelDatabase.getAllAsync();
+    const all = await databaseService.channelDatabase.getAllAsync('all');
     return all.filter((vc) => vc.isEnabled);
   } catch (err) {
     logger.warn('Failed to load virtual channels:', err);
